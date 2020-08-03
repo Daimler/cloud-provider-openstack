@@ -78,6 +78,8 @@ const (
 	activeStatus = "ACTIVE"
 	errorStatus  = "ERROR"
 
+	annotationXForwardedFor = "X-Forwarded-For"
+
 	// ServiceAnnotationLoadBalancerInternal defines whether or not to create an internal loadbalancer. Default: false.
 	ServiceAnnotationLoadBalancerInternal             = "service.beta.kubernetes.io/openstack-internal-load-balancer"
 	ServiceAnnotationLoadBalancerConnLimit            = "loadbalancer.openstack.org/connection-limit"
@@ -578,19 +580,24 @@ func getStringFromServiceAnnotation(service *corev1.Service, annotationKey strin
 	return defaultSetting
 }
 
-func getIntFromServiceAnnotation(service *corev1.Service, annotationKey string) (int, bool) {
-	intString := getStringFromServiceAnnotation(service, annotationKey, "")
-	if len(intString) > 0 {
-		annotationValue, err := strconv.Atoi(intString)
-		if err == nil {
-			klog.V(4).Infof("Found a Service Annotation: %v = %v", annotationKey, annotationValue)
-			return annotationValue, true
+//getIntFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's integer value or a specified defaultSetting
+func getIntFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting int) int {
+	klog.V(4).Infof("getIntFromServiceAnnotation(%v, %v, %v)", service, annotationKey, defaultSetting)
+	if annotationValue, ok := service.Annotations[annotationKey]; ok {
+		returnValue, err := strconv.Atoi(annotationValue)
+		if err != nil {
+			klog.V(4).Infof("Could not parse int value from \"%s\", failing back to default %s = %v, %v", annotationValue, annotationKey, defaultSetting, err)
+			return defaultSetting
 		}
+
+		klog.V(4).Infof("Found a Service Annotation: %v = %v", annotationKey, annotationValue)
+		return returnValue
 	}
-	return 0, false
+	klog.V(4).Infof("Could not find a Service Annotation; falling back to default setting: %v = %v", annotationKey, defaultSetting)
+	return defaultSetting
 }
 
-//getBoolFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's value or a specified defaultSetting
+//getBoolFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's boolean value or a specified defaultSetting
 func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting bool) (bool, error) {
 	klog.V(4).Infof("getBoolFromServiceAnnotation(%v, %v, %v)", service, annotationKey, defaultSetting)
 	if annotationValue, ok := service.Annotations[annotationKey]; ok {
@@ -919,6 +926,10 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 
 	var keepClientIP bool
 	var useProxyProtocol bool
+	var timeoutClientData int
+	var timeoutMemberData int
+	var timeoutMemberConnect int
+	var timeoutTCPInspect int
 	if !lbaas.opts.UseOctavia {
 		// Check for TCP protocol on each port
 		for _, port := range ports {
@@ -941,6 +952,11 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 		if useProxyProtocol && keepClientIP {
 			return nil, fmt.Errorf("annotation %s and %s cannot be used together", ServiceAnnotationLoadBalancerProxyEnabled, ServiceAnnotationLoadBalancerXForwardedFor)
 		}
+
+		timeoutClientData = getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutClientData, 0)
+		timeoutMemberData = getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutMemberData, 0)
+		timeoutMemberConnect = getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutMemberConnect, 0)
+		timeoutTCPInspect = getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutTCPInspect, 0)
 	}
 
 	var listenerAllowedCIDRs []string
@@ -998,16 +1014,11 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 	if err != nil {
 		return nil, fmt.Errorf("error getting LB %s listeners: %v", loadbalancer.Name, err)
 	}
+
+	connLimit := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerConnLimit, -1)
+
 	for portIndex, port := range ports {
 		listener := getListenerForPort(oldListeners, port)
-		climit := getStringFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerConnLimit, "-1")
-		connLimit := -1
-		tmp, err := strconv.Atoi(climit)
-		if err != nil {
-			klog.V(4).Infof("Could not parse int value from \"%s\" error \"%v\" failing back to default", climit, err)
-		} else {
-			connLimit = tmp
-		}
 
 		if listener == nil {
 			listenerProtocol := listeners.Protocol(port.Protocol)
@@ -1026,21 +1037,14 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 							"annotation is set", listeners.ProtocolHTTP, ServiceAnnotationLoadBalancerXForwardedFor)
 						listenerCreateOpt.Protocol = listeners.ProtocolHTTP
 					}
-					listenerCreateOpt.InsertHeaders = map[string]string{"X-Forwarded-For": "true"}
+					listenerCreateOpt.InsertHeaders = map[string]string{annotationXForwardedFor: "true"}
 				}
 
-				if timeoutClientData, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutClientData); ok {
-					listenerCreateOpt.TimeoutClientData = &timeoutClientData
-				}
-				if timeoutMemberData, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutMemberData); ok {
-					listenerCreateOpt.TimeoutMemberData = &timeoutMemberData
-				}
-				if timeoutMemberConnect, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutMemberConnect); ok {
-					listenerCreateOpt.TimeoutMemberConnect = &timeoutMemberConnect
-				}
-				if timeoutTCPInspect, ok := getIntFromServiceAnnotation(apiService, ServiceAnnotationLoadBalancerTimeoutTCPInspect); ok {
-					listenerCreateOpt.TimeoutTCPInspect = &timeoutTCPInspect
-				}
+				listenerCreateOpt.TimeoutClientData = &timeoutClientData
+				listenerCreateOpt.TimeoutMemberData = &timeoutMemberData
+				listenerCreateOpt.TimeoutMemberConnect = &timeoutMemberConnect
+				listenerCreateOpt.TimeoutTCPInspect = &timeoutTCPInspect
+
 				if len(listenerAllowedCIDRs) > 0 {
 					listenerCreateOpt.AllowedCIDRs = listenerAllowedCIDRs
 				}
@@ -1063,6 +1067,35 @@ func (lbaas *LbaasV2) EnsureLoadBalancer(ctx context.Context, clusterName string
 					updateOpts.ConnLimit = &connLimit
 					listenerChanged = true
 				}
+
+				updateOpts.InsertHeaders = &listener.InsertHeaders
+				listenerKeepClientIP := listener.InsertHeaders[annotationXForwardedFor] == "true"
+				if keepClientIP != listenerKeepClientIP {
+					if keepClientIP {
+						(*updateOpts.InsertHeaders)[annotationXForwardedFor] = "true"
+					} else {
+						delete(*updateOpts.InsertHeaders, annotationXForwardedFor)
+					}
+					listenerChanged = true
+				}
+
+				if timeoutClientData != listener.TimeoutClientData {
+					updateOpts.TimeoutClientData = &timeoutClientData
+					listenerChanged = true
+				}
+				if timeoutMemberData != listener.TimeoutMemberData {
+					updateOpts.TimeoutMemberData = &timeoutMemberData
+					listenerChanged = true
+				}
+				if timeoutMemberConnect != listener.TimeoutMemberConnect {
+					updateOpts.TimeoutMemberConnect = &timeoutMemberConnect
+					listenerChanged = true
+				}
+				if timeoutTCPInspect != listener.TimeoutTCPInspect {
+					updateOpts.TimeoutTCPInspect = &timeoutTCPInspect
+					listenerChanged = true
+				}
+
 				if openstackutil.IsOctaviaFeatureSupported(lbaas.lb, openstackutil.OctaviaFeatureVIPACL) {
 					if !cpoutil.StringListEqual(listenerAllowedCIDRs, listener.AllowedCIDRs) {
 						updateOpts.AllowedCIDRs = &listenerAllowedCIDRs
